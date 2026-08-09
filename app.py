@@ -24,6 +24,11 @@ from playwright.sync_api import sync_playwright
 APP_SECRET = os.environ.get("WA_APP_SECRET", "")
 SESSION_DIR = os.path.join(os.getcwd(), "wa_session")
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
 app = Flask(__name__)
 
 
@@ -37,16 +42,29 @@ class BrowserWorker(threading.Thread):
         self.jobs = queue.Queue()
         self.ready = threading.Event()
         self.page = None
+        self.last_load_error = None
 
     def run(self):
         with sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
                 SESSION_DIR,
                 headless=True,
-                args=["--no-sandbox"],
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+                viewport={"width": 1280, "height": 900},
+                user_agent=USER_AGENT,
             )
             self.page = context.pages[0] if context.pages else context.new_page()
-            self.page.goto("https://web.whatsapp.com")
+            # Hide the most common automation fingerprint before any page loads.
+            self.page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+            self._load_whatsapp()
+            # IMPORTANT: always reach the job loop, even if the initial load
+            # above failed - otherwise every request hangs forever with no
+            # way to retry or inspect what went wrong.
             self.ready.set()
 
             while True:
@@ -57,6 +75,17 @@ class BrowserWorker(threading.Thread):
                     result["error"] = str(exc)
                 finally:
                     done.set()
+
+    def _load_whatsapp(self):
+        try:
+            self.page.goto(
+                "https://web.whatsapp.com",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            self.last_load_error = None
+        except Exception as exc:  # noqa: BLE001
+            self.last_load_error = str(exc)
 
     def call(self, func, *args, timeout=30, **kwargs):
         result = {}
@@ -71,7 +100,7 @@ class BrowserWorker(threading.Thread):
 
 worker = BrowserWorker()
 worker.start()
-worker.ready.wait(timeout=60)
+worker.ready.wait(timeout=70)
 
 
 # ---------------------------------------------------------------------------
@@ -91,14 +120,22 @@ def check_secret():
 
 # ---------------------------------------------------------------------------
 # Browser actions (each runs on the worker thread via worker.call)
-# NOTE: WhatsApp Web's DOM changes over time. If status detection or
-# sending stops working, these selectors are the first place to check.
+# NOTE: WhatsApp Web's DOM changes over time, and it sometimes shows an
+# anti-automation warning instead of the QR to headless browsers. Use
+# /debug below if the QR never appears - it shows exactly what the
+# browser is rendering.
 # ---------------------------------------------------------------------------
 def _get_qr(page):
-    el = page.query_selector("canvas")
-    if el:
-        return base64.b64encode(el.screenshot()).decode()
-    return None
+    try:
+        el = page.wait_for_selector("canvas", timeout=5000)
+    except Exception:  # noqa: BLE001
+        return None
+    if el is None:
+        return None
+    png = el.screenshot()
+    if not png or len(png) < 200:  # blank/corrupt capture, e.g. mid-refresh
+        return None
+    return base64.b64encode(png).decode()
 
 
 def _is_logged_in(page):
@@ -113,6 +150,20 @@ def _send_message(page, phone, text):
     return True
 
 
+def _debug_info(page):
+    return {
+        "title": page.title(),
+        "url": page.url,
+        "load_error": worker.last_load_error,
+        "screenshot": base64.b64encode(page.screenshot()).decode(),
+    }
+
+
+def _reload(page):
+    worker._load_whatsapp()
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -123,16 +174,20 @@ PAGE = """
   <title>Remote WhatsApp Bridge</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; }
-    img { max-width: 280px; display: block; margin: 16px 0; }
+    img { max-width: 280px; display: block; margin: 16px 0; border: 1px solid #ddd; }
     input, textarea { width: 100%; padding: 8px; margin: 6px 0; box-sizing: border-box; }
-    button { padding: 8px 16px; cursor: pointer; }
+    button { padding: 8px 16px; cursor: pointer; margin-right: 8px; }
     #status { font-weight: bold; }
+    #debug-box { font-size: 12px; color: #444; white-space: pre-wrap; word-break: break-all; }
   </style>
 </head>
 <body>
   <h2>Remote WhatsApp Bridge</h2>
   <p id="status">Checking status…</p>
   <div id="qr-box"></div>
+  <button onclick="reload_()">Reload WhatsApp page</button>
+  <button onclick="showDebug()">View debug screenshot</button>
+  <div id="debug-box"></div>
 
   <div id="send-box" style="display:none">
     <h3>Send a message</h3>
@@ -145,25 +200,49 @@ PAGE = """
   <script>
     const key = new URLSearchParams(location.search).get("key") || "";
     const withKey = (url) => url + (url.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(key);
+    let misses = 0;
 
     async function poll() {
       const res = await fetch(withKey("/status"));
       const data = await res.json();
       if (data.logged_in) {
+        misses = 0;
         document.getElementById("status").textContent = "Connected ✅";
         document.getElementById("qr-box").innerHTML = "";
         document.getElementById("send-box").style.display = "block";
       } else {
-        document.getElementById("status").textContent = "Scan this QR code: WhatsApp → Linked Devices";
         document.getElementById("send-box").style.display = "none";
         const qrRes = await fetch(withKey("/qr"));
         const qrData = await qrRes.json();
         if (qrData.qr) {
+          misses = 0;
+          document.getElementById("status").textContent = "Scan this QR code: WhatsApp → Linked Devices";
           document.getElementById("qr-box").innerHTML =
             '<img src="data:image/png;base64,' + qrData.qr + '">';
+        } else {
+          misses++;
+          document.getElementById("status").textContent =
+            misses > 3
+              ? "Still no QR after several tries — click 'View debug screenshot' below"
+              : "Loading WhatsApp Web…";
         }
       }
       setTimeout(poll, 3000);
+    }
+
+    async function reload_() {
+      document.getElementById("status").textContent = "Reloading…";
+      await fetch(withKey("/reload"), { method: "POST" });
+      misses = 0;
+    }
+
+    async function showDebug() {
+      const res = await fetch(withKey("/debug"));
+      const data = await res.json();
+      document.getElementById("debug-box").innerHTML =
+        "<b>title:</b> " + data.title + "<br><b>url:</b> " + data.url +
+        (data.load_error ? "<br><b>load_error:</b> " + data.load_error : "") +
+        '<br><img src="data:image/png;base64,' + data.screenshot + '">';
     }
 
     async function send() {
@@ -199,6 +278,17 @@ def status():
 @app.route("/qr")
 def qr():
     return jsonify({"qr": worker.call(_get_qr)})
+
+
+@app.route("/debug")
+def debug():
+    return jsonify(worker.call(_debug_info, timeout=15))
+
+
+@app.route("/reload", methods=["POST"])
+def reload_route():
+    worker.call(_reload, timeout=65)
+    return jsonify({"ok": True})
 
 
 @app.route("/send", methods=["POST"])
